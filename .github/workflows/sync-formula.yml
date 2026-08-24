@@ -1,0 +1,62 @@
+name: Sync formula from scratchsmith
+
+# The canonical scratchsmith formula lives in the main repo (schubydoo/scratchsmith),
+# where its version/url/hash are regenerated on every release by packaging-bump.yml.
+# This tap just mirrors that file: on a schedule (and on demand — the main repo's
+# tap-sync-trigger fires a workflow_dispatch here right after a bump lands) it fetches
+# the latest Formula/scratchsmith.rb from the public main repo and commits it here if
+# it changed. Auth-free by design — it reads a public raw file over TLS and pushes with
+# this repo's own GITHUB_TOKEN. No cross-repo credentials.
+on:
+  schedule:
+    - cron: "23 6 * * *" # daily ~06:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-formula
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fetch + sync the canonical formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SRC: https://raw.githubusercontent.com/schubydoo/scratchsmith/main/Formula/scratchsmith.rb
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          # Soft no-op if the source isn't fetchable yet (e.g. the formula hasn't
+          # landed on main, or a transient blip): the tap keeps its current valid
+          # formula and the next run retries. Don't fail the scheduled job for that.
+          if ! curl -fsSL "$SRC" -o "$tmp"; then
+            echo "::notice::could not fetch $SRC (not on main yet?) — skipping this run"
+            exit 0
+          fi
+          # But DO fail closed if the fetch returned a non-formula (e.g. a 200 error
+          # page) — never commit garbage over the working formula.
+          if ! grep -q '^class Scratchsmith < Formula' "$tmp"; then
+            echo "::error::fetched content is not the scratchsmith formula"
+            exit 1
+          fi
+          if cmp -s "$tmp" Formula/scratchsmith.rb; then
+            echo "Formula already up to date — nothing to do."
+            exit 0
+          fi
+          cp "$tmp" Formula/scratchsmith.rb
+          ver="$(grep -oE 'version "[0-9]+\.[0-9]+\.[0-9]+"' Formula/scratchsmith.rb | head -1 \
+                 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/scratchsmith.rb
+          git commit -m "chore: sync scratchsmith formula ${ver:-update} from main"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+          echo "Synced formula ${ver:-(version unknown)}."
